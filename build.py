@@ -184,6 +184,93 @@ def validate_adb_version_match(resources_dir: Path) -> bool:
     return True
 
 
+VENV_DIR_NAME = '.build_venv'
+
+# Minimum Tcl/Tk version required for macOS .app bundles.
+# System Tcl/Tk 8.5 is deprecated and crashes in PyInstaller bundles.
+MIN_TCL_VERSION = (8, 6)
+
+# Candidate Python interpreters to search on macOS (prefer newer).
+MACOS_PYTHON_CANDIDATES = [
+    '/opt/homebrew/bin/python3.13',
+    '/opt/homebrew/bin/python3.12',
+    '/opt/homebrew/bin/python3.11',
+    '/opt/homebrew/bin/python3.10',
+    '/usr/local/bin/python3.13',
+    '/usr/local/bin/python3.12',
+    '/usr/local/bin/python3.11',
+    '/usr/local/bin/python3.10',
+    '/Library/Frameworks/Python.framework/Versions/3.13/bin/python3',
+    '/Library/Frameworks/Python.framework/Versions/3.12/bin/python3',
+    '/Library/Frameworks/Python.framework/Versions/3.11/bin/python3',
+]
+
+
+def _tcl_version(python_bin: str) -> tuple:
+    """Return the Tcl/Tk version tuple for a Python interpreter, or (0,0)."""
+    try:
+        out = subprocess.check_output(
+            [python_bin, '-c',
+             'import _tkinter; print(_tkinter.TCL_VERSION)'],
+            text=True, timeout=10, stderr=subprocess.DEVNULL,
+        ).strip()
+        return tuple(int(x) for x in out.split('.'))
+    except Exception:
+        return (0, 0)
+
+
+def find_suitable_python():
+    """Find a Python with Tcl/Tk >= MIN_TCL_VERSION on macOS."""
+    for candidate in MACOS_PYTHON_CANDIDATES:
+        if os.path.isfile(candidate) and _tcl_version(candidate) >= MIN_TCL_VERSION:
+            return candidate
+    return None
+
+
+def ensure_build_venv(project_dir):
+    """Create (or reuse) a venv with PyInstaller using a suitable Python.
+
+    Returns the path to the venv's python binary.
+    """
+    venv_dir = project_dir / VENV_DIR_NAME
+    venv_python = venv_dir / 'bin' / 'python3'
+
+    # Reuse existing venv if it already has a good Tcl/Tk and PyInstaller
+    if venv_python.exists():
+        if _tcl_version(str(venv_python)) >= MIN_TCL_VERSION:
+            has_pi = subprocess.run(
+                [str(venv_python), '-m', 'PyInstaller', '--version'],
+                capture_output=True, timeout=10,
+            ).returncode == 0
+            if has_pi:
+                print(f"  Reusing existing build venv: {venv_dir}")
+                return venv_python
+
+    # Find a suitable base Python
+    base_python = find_suitable_python()
+    if not base_python:
+        return None
+
+    tcl_ver = '.'.join(str(x) for x in _tcl_version(base_python))
+    print(f"  Using {base_python} (Tcl/Tk {tcl_ver})")
+    print(f"  Creating build venv at {venv_dir} ...")
+
+    # Create fresh venv
+    if venv_dir.exists():
+        shutil.rmtree(venv_dir)
+    subprocess.check_call([base_python, '-m', 'venv', str(venv_dir)])
+
+    # Install PyInstaller inside the venv
+    pip = venv_dir / 'bin' / 'pip'
+    print("  Installing PyInstaller in venv...")
+    subprocess.check_call(
+        [str(pip), 'install', '--quiet', 'pyinstaller'],
+        stdout=subprocess.DEVNULL,
+    )
+
+    return venv_python
+
+
 VALID_MODES = ('android', 'winmobile', 'both')
 
 
@@ -221,7 +308,7 @@ def generate_spec(project_dir: Path, platform: str, mode: str) -> Path:
     android = mode in ('android', 'both')
     winmobile = mode in ('winmobile', 'both')
 
-    # --- Binaries (Windows only) ---
+    # --- Binaries ---
     binaries = []
     if platform == 'windows' and android:
         binaries.extend([
@@ -229,6 +316,11 @@ def generate_spec(project_dir: Path, platform: str, mode: str) -> Path:
             "('resources/adb.exe', '.')",
             "('resources/AdbWinApi.dll', '.')",
             "('resources/AdbWinUsbApi.dll', '.')",
+        ])
+    elif platform == 'macos' and android:
+        binaries.extend([
+            "('resources/gnirehtet', '.')",
+            "('resources/adb', '.')",
         ])
 
     # --- Data files ---
@@ -311,7 +403,9 @@ exe = EXE(
 a = Analysis(
     ['src/main.py'],
     pathex=[],
-    binaries=[],
+    binaries=[
+        {binaries_str}
+    ],
     datas=[
         {datas_str}
     ],
@@ -497,19 +591,23 @@ def clean_build(project_dir: Path):
     return True
 
 
-def run_pyinstaller(project_dir: Path, platform: str, spec_file: Path) -> bool:
+def run_pyinstaller(project_dir: Path, platform: str, spec_file: Path,
+                     python_bin=None) -> bool:
     """Run PyInstaller to build the executable using the given spec file."""
     if not spec_file.exists():
         print(f"ERROR: Spec file not found: {spec_file}")
         return False
 
+    python = python_bin or sys.executable
+
     print(f"\nBuilding {platform} application with PyInstaller...")
     print(f"Spec file: {spec_file.name}")
+    print(f"Python:    {python}")
     print("-" * 50)
 
     try:
         result = subprocess.run(
-            [sys.executable, '-m', 'PyInstaller', str(spec_file), '--clean'],
+            [python, '-m', 'PyInstaller', str(spec_file), '--clean'],
             cwd=str(project_dir),
             check=True
         )
@@ -622,6 +720,27 @@ def main():
             print("Build cancelled.")
             return 1
 
+    # Step 0 (macOS only): Ensure we have a Python with working Tcl/Tk
+    build_python = None
+    if platform == 'macos':
+        cur_tcl = _tcl_version(sys.executable)
+        if cur_tcl < MIN_TCL_VERSION:
+            print(f"\n[0/5] Current Python has Tcl/Tk {'.'.join(str(x) for x in cur_tcl)} "
+                  f"(need >= {'.'.join(str(x) for x in MIN_TCL_VERSION)})...")
+            print("  System Tcl/Tk 8.5 is broken in PyInstaller .app bundles.")
+            print("  Setting up a build venv with a compatible Python...")
+            venv_python = ensure_build_venv(project_dir)
+            if venv_python is None:
+                print("\nERROR: No Python with Tcl/Tk >= 8.6 found.")
+                print("Install one with:  brew install python@3.12 python-tk@3.12")
+                print("Or download from:  https://www.python.org/downloads/")
+                return 1
+            build_python = str(venv_python)
+            tcl_ver = '.'.join(str(x) for x in _tcl_version(build_python))
+            print(f"  Build venv ready (Tcl/Tk {tcl_ver})")
+        else:
+            print(f"\n  Python Tcl/Tk {'.'.join(str(x) for x in cur_tcl)} — OK")
+
     # Step 1: Check resources
     print("\n[1/5] Checking resources...")
     if not check_resources(project_dir, platform, mode):
@@ -641,7 +760,7 @@ def main():
     # Step 4: Generate spec and run PyInstaller
     print("\n[4/5] Running PyInstaller...")
     spec_file = generate_spec(project_dir, platform, mode)
-    if not run_pyinstaller(project_dir, platform, spec_file):
+    if not run_pyinstaller(project_dir, platform, spec_file, python_bin=build_python):
         return 1
 
     # Clean up generated spec file

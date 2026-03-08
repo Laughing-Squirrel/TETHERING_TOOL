@@ -25,6 +25,7 @@ Thumbs.db
 # Virtual environments
 venv/
 .venv/
+.build_venv/
 env/
 
 # Rust build artifacts (vendored gnirehtet source)
