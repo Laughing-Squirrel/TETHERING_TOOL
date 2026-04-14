@@ -1,0 +1,20 @@
+# USB Relay Manager - Python Dependencies
+#
+# Runtime dependencies: tkinterdnd2 is optional but recommended. Without
+# it, the GUI loses drag-and-drop file support on the Files tab; every
+# other feature works identically. Packaged .exe / .app builds bundle
+# it via the PyInstaller .spec files (see USBRelay.spec,
+# USBRelay.macos.spec).
+#
+# Build dependencies: PyInstaller for creating the executable / app bundle.
+
+# Optional runtime dep: enables drag-and-drop on the Files tab.
+# Must be >= 0.4.0: older 0.3.x versions were distributed as a single
+# tkinterdnd2.py module and expected the TkDnD Tcl extension to be
+# installed system-wide. 0.4.0+ ships as a real package with the
+# TkDnD Tcl files bundled inside, which is what PyInstaller's
+# collect_data_files helper needs to see.
+tkinterdnd2>=0.4.0
+
+# Build tool - only needed for packaging
+pyinstaller>=6.0.0
